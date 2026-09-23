@@ -19,6 +19,26 @@ python scaffold.py
 - [x] **7.** strategy_report
 - [x] **8.** disaggregation_report
 
----
+## Results
 
-Built on Deep-ML.
+```
+tensor-parallel block over 4 devices: max |diff| vs single device 2.38e-07; 2 all-reduces of 4096 bytes each; analytic match True
+70B model (140 GB BF16, 80 layers, d 8192), batch 8, NVLink 300 GB/s at 3 us per hop:
+  tp=1:  140.0 GB per device, comm   0.00 ms per token (0% of the step)
+  tp=2:   70.0 GB per device, comm   1.03 ms per token (5% of the step)
+  tp=4:   35.0 GB per device, comm   2.98 ms per token (22% of the step)
+  tp=8:   17.5 GB per device, comm   6.84 ms per token (57% of the step)
+
+pipeline over 2 stages: exact True, 1 send of 4096 bytes; bubble with 1 micro-batch 75%, with 16 16%
+expert parallelism over 4 devices: exact True, 52 of 64 tokens routed off-device, 26624 bytes over two all-to-alls, load imbalance 1.50
+
+70B on eight 80 GB GPUs, decode batch 8:
+  tp=1 pp=8:  18.8 GB per device, fits True ,  44.80 ms per token
+  tp=2 pp=4:  18.8 GB per device, fits True ,  23.43 ms per token
+  tp=4 pp=2:  18.8 GB per device, fits True ,  14.18 ms per token
+  tp=8 pp=1:  18.8 GB per device, fits True ,  12.44 ms per token
+  best: tp=8 pp=1
+
+co-located: a 400 ms prefill lands in the decode loop -> max ITL 425 ms (17x the step); disaggregated: max ITL 25 ms, TTFT 425 -> 436 ms after a 10.7 ms KV transfer
+pools for 50 req/s at 2000 in / 300 out tokens: 5 prefill replicas, 6 decode replicas
+```
