@@ -213,3 +213,136 @@ def tp_mlp_forward(x, w, n, log=None):
 
     return reduced[0]
 
+# Step 3 - tp_attention_forward
+import math
+
+def attention_forward(x, w):
+    """
+    Standard causal multi-head self-attention.
+
+    x: (B, T, d)
+    """
+    B, T, d = x.shape
+    n_heads = w["n_heads"]
+    head_dim = d // n_heads
+
+    # Project inputs to queries, keys, and values.
+    q = x @ w["wq"]
+    k = x @ w["wk"]
+    v = x @ w["wv"]
+
+    # Split the hidden dimension into attention heads.
+    q = q.reshape(B, T, n_heads, head_dim).transpose(1, 2)
+    k = k.reshape(B, T, n_heads, head_dim).transpose(1, 2)
+    v = v.reshape(B, T, n_heads, head_dim).transpose(1, 2)
+
+    # Scaled dot-product attention.
+    scores = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)
+
+    # Causal mask: position t can only attend to positions <= t.
+    causal_mask = torch.triu(
+        torch.ones(T, T, dtype=torch.bool, device=x.device),
+        diagonal=1,
+    )
+    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    attn = torch.softmax(scores, dim=-1)
+    out = attn @ v
+
+    # Merge heads back into the hidden dimension.
+    out = out.transpose(1, 2).reshape(B, T, d)
+
+    # Final output projection.
+    return out @ w["wo"]
+
+
+def tp_attention_forward(x, w, n, log=None):
+    """
+    Tensor-parallel multi-head attention.
+
+    Each device owns:
+      - a column shard of wq, wk, and wv containing whole heads
+      - a row shard of wo corresponding to those heads
+
+    Each device computes a partial output and the partial outputs are
+    all-reduced. Device 0's result is returned.
+    """
+    B, T, d = x.shape
+    n_heads = w["n_heads"]
+    head_dim = d // n_heads
+
+    q_shards = shard_column(w["wq"], n)
+    k_shards = shard_column(w["wk"], n)
+    v_shards = shard_column(w["wv"], n)
+    wo_shards = shard_row(w["wo"], n)
+
+    heads_per_device = n_heads // n
+    partial_outputs = []
+
+    for i in range(n):
+        local_dim = heads_per_device * head_dim
+
+        # Project onto this device's local heads.
+        q = x @ q_shards[i]
+        k = x @ k_shards[i]
+        v = x @ v_shards[i]
+
+        # Arrange as (B, local_heads, T, head_dim).
+        q = q.reshape(B, T, heads_per_device, head_dim).transpose(1, 2)
+        k = k.reshape(B, T, heads_per_device, head_dim).transpose(1, 2)
+        v = v.reshape(B, T, heads_per_device, head_dim).transpose(1, 2)
+
+        # Scaled causal self-attention for the local heads.
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)
+
+        causal_mask = torch.triu(
+            torch.ones(T, T, dtype=torch.bool, device=x.device),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)
+        local_out = attn @ v
+
+        # Merge this device's heads: (B, T, local_dim).
+        local_out = local_out.transpose(1, 2).reshape(B, T, local_dim)
+
+        # Apply this device's row shard of the output projection.
+        partial_outputs.append(local_out @ wo_shards[i])
+
+    # Combine contributions from all devices.
+    reduced = all_reduce(partial_outputs, log=log)
+
+    return reduced[0]
+
+
+def block_forward(x, w):
+    """
+    Standard pre-norm transformer block:
+        x + attention(rmsnorm(x, g1))
+        + mlp(rmsnorm(previous_output, g2))
+    """
+    attn_input = rmsnorm(x, w["g1"])
+    x = x + attention_forward(attn_input, w)
+
+    mlp_input = rmsnorm(x, w["g2"])
+    x = x + mlp_forward(mlp_input, w)
+
+    return x
+
+
+def tp_block_forward(x, w, n, log=None):
+    """
+    Tensor-parallel pre-norm transformer block.
+
+    The attention and MLP each perform one all-reduce, giving exactly
+    two all-reduces for the complete transformer layer.
+    """
+    attn_input = rmsnorm(x, w["g1"])
+    x = x + tp_attention_forward(attn_input, w, n, log=log)
+
+    mlp_input = rmsnorm(x, w["g2"])
+    x = x + tp_mlp_forward(mlp_input, w, n, log=log)
+
+    return x
+
