@@ -738,3 +738,130 @@ def load_imbalance(expert_ids, n_experts):
 
     return float(counts.max() / mean_load)
 
+# Step 7 - strategy_report
+def device_memory(weight_bytes, kv_bytes, tp, pp):
+    """
+    Return the per-device memory footprint for a given TP x PP split.
+    """
+    return (weight_bytes + kv_bytes) / (tp * pp)
+
+
+def token_time(
+    weight_bytes,
+    kv_bytes,
+    n_layers,
+    batch,
+    d,
+    bytes_per_elem,
+    tp,
+    pp,
+    hw,
+):
+    """
+    Estimate the time to process one decode token.
+
+    The total consists of:
+      1. Memory-bound weight + KV streaming time.
+      2. Tensor-parallel communication time.
+      3. Point-to-point communication between pipeline stages.
+    """
+    # Per-device bytes streamed for one decode token.
+    streamed_bytes = (weight_bytes + kv_bytes) / tp
+
+    memory_time = streamed_bytes / hw["hbm_bandwidth"]
+
+    # Tensor-parallel communication.
+    comm_time = tp_token_time(
+        n_layers,
+        batch,
+        d,
+        bytes_per_elem,
+        tp,
+        hw["bandwidth"],
+        hw["latency"],
+    )
+
+    # Point-to-point transfers between consecutive pipeline stages.
+    p2p_time = (pp - 1) * (
+        batch * d * bytes_per_elem / hw["bandwidth"]
+        + hw["latency"]
+    )
+
+    return memory_time + comm_time + p2p_time
+
+
+def strategy_report(
+    weight_bytes,
+    kv_bytes,
+    n_layers,
+    d,
+    batch,
+    bytes_per_elem,
+    n_gpus,
+    hw,
+):
+    """
+    Enumerate all tensor-parallel x pipeline-parallel configurations
+    whose product equals n_gpus, with both dimensions powers of two.
+    """
+    rows = []
+
+    for tp in range(1, n_gpus + 1):
+        # Both TP and PP must be powers of two.
+        if tp & (tp - 1):
+            continue
+
+        if n_gpus % tp != 0:
+            continue
+
+        pp = n_gpus // tp
+
+        if pp & (pp - 1):
+            continue
+
+        memory = device_memory(
+            weight_bytes,
+            kv_bytes,
+            tp,
+            pp,
+        )
+
+        ms_per_token = token_time(
+            weight_bytes,
+            kv_bytes,
+            n_layers,
+            batch,
+            d,
+            bytes_per_elem,
+            tp,
+            pp,
+            hw,
+        ) * 1000
+
+        rows.append(
+            {
+                "tp": tp,
+                "pp": pp,
+                "memory_gb": round(memory / 1e9, 3),
+                "fits": memory <= hw["memory_bytes"],
+                "ms_per_token": round(ms_per_token, 3),
+            }
+        )
+
+    return rows
+
+
+def best_strategy(report):
+    """
+    Return the lowest-latency strategy among configurations that fit
+    within the available device memory.
+
+    Return None when no configuration fits.
+    """
+    fitting = [row for row in report if row["fits"]]
+
+    if not fitting:
+        return None
+
+    return min(fitting, key=lambda row: row["ms_per_token"])
+
