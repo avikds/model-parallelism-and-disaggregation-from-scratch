@@ -13,6 +13,7 @@ python scaffold.py
 - [x] **1.** CommLog
 - [x] **2.** tp_mlp_forward
 - [x] **3.** tp_attention_forward
+- [x] **4.** tp_layer_traffic
 
 ---
 

@@ -346,3 +346,109 @@ def tp_block_forward(x, w, n, log=None):
 
     return x
 
+# Step 4 - tp_layer_traffic
+def tp_layer_traffic(batch, seq, d, bytes_per_elem):
+    """
+    Return the payload carried by one all-reduce in a transformer layer.
+    """
+    return batch * seq * d * bytes_per_elem
+
+
+def tp_token_time(n_layers, batch, d, bytes_per_elem, n, bandwidth, latency):
+    """
+    Return tensor-parallel communication time per decode token.
+
+    Each transformer layer performs two all-reduces.
+    """
+    if n == 1:
+        return 0.0
+
+    nbytes = batch * d * bytes_per_elem
+
+    return 2 * n_layers * ring_time(
+        nbytes,
+        n,
+        bandwidth,
+        latency,
+    )
+
+
+def weight_bytes_per_device(total_weight_bytes, n):
+    """
+    Return the weight memory assigned to one tensor-parallel device.
+    """
+    return total_weight_bytes / n
+
+
+def tp_report(
+    n_layers,
+    d,
+    batch,
+    total_weight_bytes,
+    bytes_per_elem,
+    hw,
+    n_options,
+):
+    """
+    Return tensor-parallel tradeoff information for each TP degree.
+    """
+    rows = []
+
+    for n in n_options:
+        weight_bytes = weight_bytes_per_device(total_weight_bytes, n)
+
+        # Communication time for all TP all-reduces per decode token.
+        comm_time = tp_token_time(
+            n_layers,
+            batch,
+            d,
+            bytes_per_elem,
+            n,
+            hw["bandwidth"],
+            hw["latency"],
+        )
+
+        # Per-device memory-bound compute time uses HBM bandwidth.
+        compute_time = weight_bytes / hw["hbm_bandwidth"]
+
+        total_time = comm_time + compute_time
+
+        comm_share = (
+            comm_time / total_time
+            if total_time != 0
+            else 0.0
+        )
+
+        rows.append(
+            {
+                "tp": n,
+                "weight_gb_per_device": round(weight_bytes / 1e9, 4),
+                "comm_ms_per_token": round(comm_time * 1000, 4),
+                "comm_share": round(comm_share, 4),
+            }
+        )
+
+    return rows
+
+
+def measured_matches_analytic(x, w, n):
+    """
+    Verify that the simulated TP block moves exactly the analytically
+    expected number of bytes: two all-reduces, each carrying one
+    batch * sequence * hidden-size payload.
+    """
+    B, T, d = x.shape
+
+    log = CommLog()
+
+    tp_block_forward(x, w, n, log=log)
+
+    expected_bytes = 2 * tp_layer_traffic(
+        B,
+        T,
+        d,
+        x.element_size(),
+    )
+
+    return log.total_bytes() == expected_bytes
+
