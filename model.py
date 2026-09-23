@@ -534,3 +534,207 @@ def pipeline_traffic(batch, seq, d, bytes_per_elem, n_stages):
         * bytes_per_elem
     )
 
+# Step 6 - expert_parallel_dispatch
+import torch
+
+
+def init_experts(n_experts, d, hidden, seed):
+    """
+    Initialize all experts from a single deterministically seeded generator.
+
+    For each expert, weights are generated in the order:
+    w1, w3, w2.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    experts = []
+
+    for _ in range(n_experts):
+        w1 = torch.randn(
+            d,
+            hidden,
+            generator=generator,
+            dtype=torch.float32,
+        ) * 0.05
+
+        w3 = torch.randn(
+            d,
+            hidden,
+            generator=generator,
+            dtype=torch.float32,
+        ) * 0.05
+
+        w2 = torch.randn(
+            hidden,
+            d,
+            generator=generator,
+            dtype=torch.float32,
+        ) * 0.05
+
+        experts.append({
+            "w1": w1,
+            "w3": w3,
+            "w2": w2,
+        })
+
+    return experts
+
+
+def expert_forward(x, e):
+    """
+    Gated MLP forward pass for one expert.
+    """
+    return (torch.nn.functional.silu(x @ e["w1"]) * (x @ e["w3"])) @ e["w2"]
+
+
+def moe_dense_forward(x_tokens, expert_ids, experts):
+    """
+    Reference MoE implementation where every token is evaluated
+    directly by its assigned expert.
+    """
+    out = torch.empty_like(x_tokens)
+
+    for i in range(x_tokens.shape[0]):
+        expert_id = int(expert_ids[i].item())
+        out[i] = expert_forward(
+            x_tokens[i:i + 1],
+            experts[expert_id],
+        )[0]
+
+    return out
+
+
+def expert_parallel_dispatch(x_tokens, expert_ids, experts, n_devices, log=None):
+    """
+    Route tokens to the devices containing their experts, execute the
+    experts, and route the outputs back to the original token owners.
+
+    Returns:
+        out: results in the original token order
+        off_device_tokens: number of tokens whose expert is on another device
+    """
+    n_tokens, d = x_tokens.shape
+    n_experts = len(experts)
+
+    # Each device hosts an equal number of experts.
+    experts_per_device = n_experts // n_devices
+
+    # Initial token ownership is contiguous.
+    token_chunks = torch.arange(
+        n_tokens,
+        device=x_tokens.device,
+    ).chunk(n_devices)
+
+    # buckets[src][dst] contains tokens sent from src to dst.
+    buckets = [
+        [None for _ in range(n_devices)]
+        for _ in range(n_devices)
+    ]
+
+    # Keep token indices and expert IDs as simulation metadata.
+    bucket_indices = [
+        [[] for _ in range(n_devices)]
+        for _ in range(n_devices)
+    ]
+
+    bucket_experts = [
+        [[] for _ in range(n_devices)]
+        for _ in range(n_devices)
+    ]
+
+    off_device_tokens = 0
+
+    for src in range(n_devices):
+        for idx_tensor in token_chunks[src]:
+            token_idx = int(idx_tensor.item())
+            expert_id = int(expert_ids[token_idx].item())
+
+            dst = expert_id // experts_per_device
+
+            bucket_indices[src][dst].append(token_idx)
+            bucket_experts[src][dst].append(expert_id)
+
+            if src != dst:
+                off_device_tokens += 1
+
+    # Construct tensor buckets for the first all-to-all.
+    for src in range(n_devices):
+        for dst in range(n_devices):
+            indices = bucket_indices[src][dst]
+
+            if indices:
+                idx = torch.tensor(
+                    indices,
+                    dtype=torch.long,
+                    device=x_tokens.device,
+                )
+                buckets[src][dst] = x_tokens[idx]
+            else:
+                buckets[src][dst] = x_tokens.new_empty((0, d))
+
+    # First exchange: owning devices -> expert devices.
+    received = all_to_all(buckets, log=log)
+
+    # Compute each received token using its assigned expert.
+    return_buckets = [
+        [None for _ in range(n_devices)]
+        for _ in range(n_devices)
+    ]
+
+    for dst in range(n_devices):
+        for src in range(n_devices):
+            tokens = received[dst][src]
+            expert_list = bucket_experts[src][dst]
+
+            if tokens.shape[0] == 0:
+                return_buckets[dst][src] = tokens.new_empty((0, d))
+                continue
+
+            result = torch.empty_like(tokens)
+
+            for j, expert_id in enumerate(expert_list):
+                result[j] = expert_forward(
+                    tokens[j:j + 1],
+                    experts[expert_id],
+                )[0]
+
+            # Results are sent back to their original owner.
+            return_buckets[dst][src] = result
+
+    # Second exchange: expert devices -> original owning devices.
+    returned = all_to_all(return_buckets, log=log)
+
+    # Reassemble results in the original token order.
+    out = torch.empty_like(x_tokens)
+
+    for src in range(n_devices):
+        for dst in range(n_devices):
+            indices = bucket_indices[src][dst]
+
+            if indices:
+                idx = torch.tensor(
+                    indices,
+                    dtype=torch.long,
+                    device=x_tokens.device,
+                )
+                out[idx] = returned[src][dst]
+
+    return out, off_device_tokens
+
+
+def load_imbalance(expert_ids, n_experts):
+    """
+    Return max expert load divided by mean expert load.
+    """
+    counts = torch.bincount(
+        expert_ids.to(torch.long),
+        minlength=n_experts,
+    ).to(torch.float32)
+
+    mean_load = counts.mean()
+
+    if mean_load == 0:
+        return 0.0
+
+    return float(counts.max() / mean_load)
+

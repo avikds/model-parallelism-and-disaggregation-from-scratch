@@ -15,6 +15,7 @@ python scaffold.py
 - [x] **3.** tp_attention_forward
 - [x] **4.** tp_layer_traffic
 - [x] **5.** pipeline_forward
+- [x] **6.** expert_parallel_dispatch
 
 ---
 
