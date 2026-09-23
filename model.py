@@ -452,3 +452,85 @@ def measured_matches_analytic(x, w, n):
 
     return log.total_bytes() == expected_bytes
 
+# Step 5 - pipeline_forward
+def assign_stages(n_layers, n_stages):
+    """
+    Assign contiguous layer indices to pipeline stages.
+
+    The first (n_layers % n_stages) stages receive one extra layer.
+    """
+    base_layers = n_layers // n_stages
+    extra_layers = n_layers % n_stages
+
+    stages = []
+    current_layer = 0
+
+    for stage in range(n_stages):
+        stage_size = base_layers + (1 if stage < extra_layers else 0)
+
+        stages.append(
+            list(range(current_layer, current_layer + stage_size))
+        )
+
+        current_layer += stage_size
+
+    return stages
+
+
+def pipeline_bubble(n_stages, n_microbatches):
+    """
+    Return the idle fraction of a GPipe-style pipeline schedule.
+    """
+    return (n_stages - 1) / (n_microbatches + n_stages - 1)
+
+
+def pipeline_makespan(n_stages, n_microbatches, stage_time):
+    """
+    Return the total pipeline makespan.
+    """
+    return (n_microbatches + n_stages - 1) * stage_time
+
+
+def model_forward(x, blocks):
+    """
+    Apply all transformer blocks sequentially.
+    """
+    for block in blocks:
+        x = block_forward(x, block)
+
+    return x
+
+
+def pipeline_forward(x, blocks, n_stages, log=None):
+    """
+    Run the model stage by stage.
+
+    Each stage processes its assigned contiguous subset of blocks.
+    After every stage except the final stage, record the activation
+    transfer to the next pipeline stage.
+    """
+    stages = assign_stages(len(blocks), n_stages)
+
+    for stage_idx, layer_indices in enumerate(stages):
+        for layer_idx in layer_indices:
+            x = block_forward(x, blocks[layer_idx])
+
+        # The activation is sent to the next pipeline stage.
+        if stage_idx < n_stages - 1 and log is not None:
+            log.record("p2p", 2, tensor_bytes(x))
+
+    return x
+
+
+def pipeline_traffic(batch, seq, d, bytes_per_elem, n_stages):
+    """
+    Return the total activation traffic between pipeline stages.
+    """
+    return (
+        (n_stages - 1)
+        * batch
+        * seq
+        * d
+        * bytes_per_elem
+    )
+
