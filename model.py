@@ -865,3 +865,97 @@ def best_strategy(report):
 
     return min(fitting, key=lambda row: row["ms_per_token"])
 
+# Step 8 - disaggregation_report
+def kv_transfer_time(prompt_len, kv_bytes_per_token, link_bandwidth):
+    """
+    Return the time required to transfer the prompt's KV cache.
+    """
+    return (prompt_len * kv_bytes_per_token) / link_bandwidth
+
+
+def colocated_timeline(decode_step_s, n_steps, prefill_s, arrive_step):
+    """
+    Model a decode stream sharing a GPU with a newly arriving prefill.
+
+    The prefill runs before the decode step at `arrive_step`, creating
+    one inter-token latency spike. The new request's first token is
+    produced by the following decode step.
+    """
+    itl_list = [decode_step_s] * n_steps
+
+    if 0 <= arrive_step < n_steps:
+        itl_list[arrive_step] = prefill_s + decode_step_s
+
+    ttft_new = prefill_s + decode_step_s
+
+    return (
+        [round(t, 6) for t in itl_list],
+        round(ttft_new, 6),
+    )
+
+
+def disaggregated_timeline(decode_step_s, n_steps, prefill_s, transfer_s):
+    """
+    Model decode running on a separate GPU pool from prefill.
+
+    The existing decode stream is unaffected by the prefill.
+    """
+    itl_list = [round(decode_step_s, 6)] * n_steps
+
+    ttft_new = prefill_s + transfer_s + decode_step_s
+
+    return (
+        itl_list,
+        round(ttft_new, 6),
+    )
+
+
+def pool_sizes(arrival_rate, in_len, out_len, prefill_tps, decode_tps):
+    """
+    Return the required prefill and decode pool sizes.
+    """
+    prefill_load = arrival_rate * in_len / prefill_tps
+    decode_load = arrival_rate * out_len / decode_tps
+
+    # Inputs are non-negative in the intended workload model.
+    prefill_pool = int(prefill_load) + (prefill_load > int(prefill_load))
+    decode_pool = int(decode_load) + (decode_load > int(decode_load))
+
+    return prefill_pool, decode_pool
+
+
+def disaggregation_report(
+    decode_step_s,
+    n_steps,
+    prefill_s,
+    arrive_step,
+    transfer_s,
+):
+    """
+    Compare colocated and disaggregated execution.
+    """
+    colocated_itl, colocated_ttft = colocated_timeline(
+        decode_step_s,
+        n_steps,
+        prefill_s,
+        arrive_step,
+    )
+
+    disaggregated_itl, disaggregated_ttft = disaggregated_timeline(
+        decode_step_s,
+        n_steps,
+        prefill_s,
+        transfer_s,
+    )
+
+    colocated_max_itl = max(colocated_itl)
+    disaggregated_max_itl = max(disaggregated_itl)
+
+    return {
+        "colocated_max_itl": round(colocated_max_itl, 6),
+        "disaggregated_max_itl": round(disaggregated_max_itl, 6),
+        "colocated_ttft": round(colocated_ttft, 6),
+        "disaggregated_ttft": round(disaggregated_ttft, 6),
+        "itl_spike": round(colocated_max_itl / decode_step_s, 3),
+    }
+
