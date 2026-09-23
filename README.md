@@ -11,6 +11,7 @@ python scaffold.py
 ## Steps
 
 - [x] **1.** CommLog
+- [x] **2.** tp_mlp_forward
 
 ---
 
